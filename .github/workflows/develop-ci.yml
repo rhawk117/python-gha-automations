@@ -1,0 +1,21 @@
+name: Develop CI
+
+on:
+  pull_request:
+    branches: [develop]
+
+concurrency:
+  group: develop-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  quality:
+    name: Code Quality Checks (Lint, Dev Test Suite)
+    uses: ./.github/workflows/code-quality.yml
+    secrets: inherit
+    with:
+      pytest-marker: "smoke or unit or security"

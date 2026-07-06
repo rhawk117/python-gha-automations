@@ -1,0 +1,97 @@
+name: Run Pytest
+description: |
+  Runs pytest with a marker expression and coverage gate, uploads the
+  coverage artifact, writes a step summary, and posts failure/success PR
+  comments. Assumes the caller has already checked out the repo, run
+  `uv sync --dev`, and provisioned any infra the marker expression needs.
+
+inputs:
+  marker:
+    required: true
+    description: pytest -m marker expression selecting which tests to run
+
+  coverage:
+    required: true
+    description: --cov-fail-under threshold; pass 0 to disable the gate
+
+  failure-marker:
+    required: true
+    description: PR-comment marker slug used on failure
+
+  success-marker:
+    required: false
+    default: ''
+    description: |
+      PR-comment marker slug used on success (coverage-artifact link +
+      auto-qa reminder); leave empty to skip the success comment entirely
+
+runs:
+  using: composite
+  steps:
+    - name: Run Tests w/ Coverage Gate
+      id: pytest
+      shell: bash
+      env:
+        TEST_MARKER: ${{ inputs.marker }}
+        REQUIRED_COVERAGE: ${{ inputs.coverage }}
+      run: |
+        set -o pipefail
+        uv run pytest -m "$TEST_MARKER" \
+          --cov=app \
+          --cov-report=term-missing \
+          --cov-report=html \
+          --cov-report=xml \
+          --cov-fail-under="$REQUIRED_COVERAGE" \
+          | tee pytest-output.txt
+
+    - name: Tests + Coverage Step Summary
+      if: ${{ always() }}
+      shell: bash
+      env:
+        PYTEST_OUTCOME: ${{ steps.pytest.outcome }}
+      run: |
+        {
+          printf '%s\n' "### Tests (-m \"${{ inputs.marker }}\")" ""
+          if [[ "$PYTEST_OUTCOME" == "success" ]]; then
+            printf '%s\n' ":white_check_mark: suite passed"
+          else
+            printf '%s\n' ":x: suite failed"
+          fi
+          printf '%s\n' "" "<details><summary>Coverage report</summary>" ""
+          uv run coverage report --format=markdown || printf '%s\n' "_no coverage data_"
+          printf '%s\n' "" "</details>"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Upload Coverage Report
+      id: coverage
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: coverage-report-${{ github.run_id }}
+        retention-days: 14
+        if-no-files-found: ignore
+        path: |
+          htmlcov/
+          coverage.xml
+
+
+    - name: Compose PR Comment
+      if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+      id: comment
+      shell: bash
+      env:
+        OUTCOME: ${{ steps.pytest.outcome }}
+        SUCCESS_MARKER: ${{ inputs.success-marker }}
+        FAILURE_MARKER: ${{ inputs.failure-marker }}
+        ARTIFACT_URL: ${{ steps.coverage.outputs.artifact-url }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        bash "${{ github.action_path }}/compose-comment.sh"
+
+
+    - name: Post PR Comment
+      if: ${{ !cancelled() && steps.comment.outputs.post == 'true' }}
+      uses: ./.github/actions/pr-comment
+      with:
+        marker: ${{ steps.comment.outputs.marker }}
+        body-file: COMMENT.md

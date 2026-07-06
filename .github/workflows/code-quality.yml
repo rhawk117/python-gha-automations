@@ -1,0 +1,99 @@
+name: Code Quality
+
+on:
+  workflow_call:
+    inputs:
+      run-quality:
+        type: boolean
+        default: true
+        description: |
+          Run the lint/typecheck/py-compile job
+
+      run-dependency-audit:
+        type: boolean
+        default: true
+        description: |
+          Run the pip-audit dependency audit job
+
+      pytest-marker:
+        type: string
+        required: true
+        description: |
+          pytest -m marker expression selecting which tests to run
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  code-quality:
+    name: Code Quality Checks
+    runs-on: ubuntu-latest
+    if: ${{ inputs.run-quality }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up UV
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      - name: Check Lockfile (uv.lock)
+        run: |
+          uv lock --check
+          echo "- :white_check_mark: lockfile in sync" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Quality Checks (lint, typecheck, py-compile)
+        shell: bash
+        run: |
+          bash scripts/code-quality.sh all
+          echo "- :white_check_mark: lint, typecheck, py-compile" >> "$GITHUB_STEP_SUMMARY"
+
+  dependency-audit:
+    name: Dependency Audit (pip-audit)
+    runs-on: ubuntu-latest
+    if: ${{ inputs.run-dependency-audit }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up UV
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Run Dependency Audit
+        uses: ./.github/actions/pysupply-chain
+
+  test-unit-smoke:
+    name: Unit & Smoke Tests
+    needs: [code-quality]
+    if: ${{ !cancelled() && (needs.code-quality.result == 'success' || needs.code-quality.result == 'skipped') && !(contains(inputs.pytest-marker, 'integration') || contains(inputs.pytest-marker, 'e2e')) }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up UV
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Install Dependencies
+        run: uv sync --dev
+
+      - name: Run Tests
+        uses: ./.github/actions/run-pytest
+        with:
+          marker: ${{ inputs.pytest-marker }}
+          coverage: ${{ vars.REQUIRED_CODE_COVERAGE }}
+          failure-marker: kc-ci-test-failure
+          success-marker: kc-ci-coverage
