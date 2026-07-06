@@ -1,0 +1,155 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version bump level
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+
+permissions:
+  contents: write
+  packages: write
+  pull-requests: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  release:
+    name: Bump, Tag & Publish
+    # ubuntu-latest: the self-hosted runner has no docker CLI
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Preflight guards
+        run: |
+          if [[ '${{ github.ref }}' != 'refs/heads/main' ]]; then
+            printf '%s\n' "::error::Release must be dispatched from main, got '${{ github.ref_name }}'."
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor origin/staging HEAD; then
+            printf '%s\n' '::error::staging is not an ancestor of main — merge the staging -> main release PR (merge commit, never squash) before releasing.'
+            exit 1
+          fi
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Bump version
+        run: |
+          uv version --bump "${{ inputs.bump }}"
+          uv lock
+          VERSION="$(uv version --short)"
+          if git rev-parse -q --verify "refs/tags/v$VERSION" > /dev/null; then
+            printf '%s\n' "::error::Tag v$VERSION already exists."
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          printf '%s\n' "::notice::Releasing v$VERSION"
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      - name: Export OpenAPI schema
+        run: uv run python -m scripts.export_openapi --output openapi.json
+
+      - name: Commit and tag locally
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add pyproject.toml uv.lock
+          git commit -m "release(${{ inputs.bump }}): v$VERSION"
+          git tag "v$VERSION"
+
+      # image is built and pushed before any git push so a failed build
+      # aborts the release with nothing published to main
+      - name: Build and push image
+        uses: ./.github/actions/build-push-image
+        with:
+          image: ghcr.io/${{ github.repository }}
+          tags: v${{ env.VERSION }} latest
+          push: "true"
+          version: ${{ env.VERSION }}
+          registry-username: ${{ github.actor }}
+          registry-password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push main and tag
+        run: git push origin main "v$VERSION"
+
+      - name: Collect release notes from release PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr list --state merged --base main --head staging \
+            --limit 1 --json body --jq '.[0].body // ""' > release-notes.md
+          if [[ -s release-notes.md ]]; then
+            echo "NOTES_SOURCE=release-pr" >> "$GITHUB_ENV"
+          else
+            echo "NOTES_SOURCE=generated" >> "$GITHUB_ENV"
+            printf '%s\n' '::warning::No merged staging -> main PR body found; falling back to --generate-notes.'
+          fi
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [[ "$NOTES_SOURCE" == 'release-pr' ]]; then
+            gh release create "v$VERSION" openapi.json \
+              --title "v$VERSION" \
+              --notes-file release-notes.md
+          else
+            gh release create "v$VERSION" openapi.json \
+              --title "v$VERSION" \
+              --generate-notes
+          fi
+
+      - name: Open back-merge PR into develop
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          body="$(printf '%s\n' \
+            "Back-merge of the v$VERSION release commit into \`develop\`." \
+            '' \
+            'CI does not run automatically on PRs opened with `GITHUB_TOKEN` — close and' \
+            'reopen this PR to trigger develop-ci, or merge directly: the contents are' \
+            'exactly what main-ci just tested plus the version bump commit.')"
+          if ! gh pr create --base develop --head main \
+            --title "chore(back-merge): v$VERSION into develop" \
+            --body "$body"; then
+            printf '%s\n' '::warning::Could not open the back-merge PR (it may already exist) — open main -> develop manually.'
+          fi
+
+      - name: Release summary
+        if: always()
+        run: |
+          printf '%s\n' \
+            "## Release v${VERSION:-unknown}" \
+            "" \
+            "| | |" \
+            "|---|---|" \
+            "| Status | ${{ job.status }} |" \
+            "| Bump | \`${{ inputs.bump }}\` |" \
+            "| Version | \`v${VERSION:-unknown}\` |" \
+            "| Tag | [\`v$VERSION\`](${{ github.server_url }}/${{ github.repository }}/releases/tag/v$VERSION) |" \
+            "| Commit | \`release(${{ inputs.bump }}): v$VERSION\` |" \
+            "| Image | \`ghcr.io/${{ github.repository }}:v$VERSION\` (+ \`:latest\`) |" \
+            "| OpenAPI | attached to the release as \`openapi.json\` |" \
+            "| Notes | ${NOTES_SOURCE:-unknown} |" \
+            "| Back-merge | PR \`main -> develop\` (merge to finish the release) |" \
+            "| Triggered by | @${{ github.actor }} |" \
+            >> "$GITHUB_STEP_SUMMARY"
