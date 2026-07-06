@@ -86,7 +86,7 @@ runs:
         ARTIFACT_URL: ${{ steps.coverage.outputs.artifact-url }}
         RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       run: |
-        bash "${{ github.action_path }}/compose-comment.sh"
+        bash "${{ github.action_path }}/compose-comments.sh"
 
 
     - name: Post PR Comment
